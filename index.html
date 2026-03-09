@@ -2736,17 +2736,19 @@
     function mapCcFromDb(row) { return { id: row.id, cod: row.cod, nome: row.nome, resp: row.resp || '', orc: +(row.orc) || 0, desc: row.descricao || '', cor: row.cor || '#2563eb' }; }
     function mapNatFromDb(row) { return { id: row.id, cod: row.cod, nome: row.nome, cat: row.cat || 'Outros', conta: row.conta || '', desc: row.descricao || '', cor: row.cor || '#059669' }; }
     function mapFornFromDb(row) { return { id: row.id, nome: row.nome, doc: row.doc || '', tipo: row.tipo || 'ARQUIVO TED', conta: row.conta || '', natId: row.nat_id, ccId: row.cc_id, obs: row.obs || '', pags: row.pags || 0, total: +(row.total) || 0, regime: row.regime || 'Simples Nacional' }; }
+    function mapFpFromDb(row) { return { id: row.id, label: row.fornecedor_padrao, natId: row.nat_id, ccId: row.cc_id, hist: row.historico_template }; }
     function mapNfFromDb(row) { return { id: row.id, data: row.data || '', tipo: row.tipo || 'ARQUIVO TED', fornId: row.forn_id, fornNome: row.forn_nome || '', nfNum: row.nf_num || '', natId: row.nat_id, ccId: row.cc_id, vb: +(row.vb) || 0, dc: +(row.dc) || 0, vl: +(row.vl) || 0, venc: row.venc || '', conta: row.conta || '', hist: row.hist || '', status: row.status || 'PENDENTE', origem: row.origem || 'MANUAL', competencia: row.competencia || (row.data ? row.data.slice(0, 7) : ''), dataPagamento: row.data_pagamento || null }; }
 
     async function loadStateFromSupabase() {
       try {
-        const [ccRows, natRows, fornRows, nfRows] = await Promise.all([
-          sbSelect('centros_custo'), sbSelect('naturezas'), sbSelect('fornecedores'), sbSelect('notas_fiscais')
+        const [ccRows, natRows, fornRows, nfRows, fpRows] = await Promise.all([
+          sbSelect('centros_custo'), sbSelect('naturezas'), sbSelect('fornecedores'), sbSelect('notas_fiscais'), sbSelect('fornecedor_padrao')
         ]);
         S.cc = ccRows.map(mapCcFromDb);
         S.nat = natRows.map(mapNatFromDb);
         S.forn = fornRows.map(mapFornFromDb);
         S.nfs = nfRows.map(mapNfFromDb);
+        S.fp = fpRows.map(mapFpFromDb);
         importCount = S.nfs.filter(n => n.origem === 'IMPORTADO').length;
         // Cache local
         saveStateLocal(true);
@@ -2759,7 +2761,7 @@
 
     function saveStateLocal(silent = false) {
       try {
-        const payload = { version: 2, importCount, cc: S.cc, nat: S.nat, forn: S.forn, nfs: S.nfs, lastSavedAt: new Date().toISOString() };
+        const payload = { version: 3, importCount, cc: S.cc, nat: S.nat, forn: S.forn, nfs: S.nfs, fp: S.fp, lastSavedAt: new Date().toISOString() };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       } catch (err) {
         if (!silent && !persistWarned) { persistWarned = true; toast('Falha ao salvar cache local.', 'w'); }
@@ -2777,7 +2779,7 @@
     let acIdx = -1, acRes = [];
     let uploadedFiles = [], extractedRows = [], importCount = 0;
 
-    const S = { cc: [], nat: [], forn: [], nfs: [] };
+    const S = { cc: [], nat: [], forn: [], nfs: [], fp: [] };
     const STORAGE_KEY = 'contas-pagar::v3';
     let persistWarned = false;
 
@@ -2831,6 +2833,7 @@
         if (raw) {
           const data = JSON.parse(raw);
           S.cc = data.cc || []; S.nat = data.nat || []; S.forn = data.forn || []; S.nfs = data.nfs || [];
+          S.fp = data.fp || [];
           importCount = data.importCount || 0;
         }
       } catch (e) { /* ignore */ }
@@ -3002,6 +3005,15 @@
       }
     }
 
+    function getSupplierSuggestion(name) {
+      if (!name) return null;
+      const q = name.toUpperCase();
+      // Prioridade 1: Mapeamento direto da planilha (FP)
+      const fp = S.fp.find(x => q.includes(x.label.toUpperCase()) || x.label.toUpperCase().includes(q));
+      if (fp) return { natId: fp.natId, ccId: fp.ccId, hist: fp.hist };
+      return null;
+    }
+
     // ══ EXTRACTION ENGINE ══
     async function startExtraction() {
       if (!uploadedFiles.length) return;
@@ -3024,7 +3036,7 @@
             continue;
           }
 
-          // --- CONCILIAÇÃO COM PROTOCOLO ---
+          // --- CONCILIAÇÃO COM PROTOCOLO E MAPEAMENTO HISTÓRICO ---
           if (protocolData.length) {
             const fileName = f.name.toLowerCase();
             let match = protocolData.find(p => p.nf && (fileName.includes(p.nf) || row.nfNum.includes(p.nf)));
@@ -3043,7 +3055,16 @@
               }
             }
           }
-          // ---------------------------------
+
+          // MAPEAMENTO HISTÓRICO (Planilha Google)
+          const sugg = getSupplierSuggestion(row.fornNome);
+          if (sugg) {
+            if (sugg.natId) row.natId = sugg.natId;
+            if (sugg.ccId) row.ccId = sugg.ccId;
+            if (sugg.hist) row.protoDesc = sugg.hist.replace('{NF}', row.nfNum).replace('{MES_ANO}', todayISO().slice(0, 7));
+            addLog('info', `✨ Mapeamento: Sugestão aplicada para ${row.fornNome}`);
+          }
+          // ---------------------------------------------------------
 
           // Padroniza o histórico seguindo o formato da planilha
           row.hist = buildFluxoHistory(row.natId, row.fornNome, row.nfNum, row.hist);
@@ -4142,22 +4163,31 @@
       sv('nf-conta', f.conta);
       popSels();
 
-      // INTELIGÊNCIA: Buscar Natureza/CC mais usados no histórico deste fornecedor
+      // INTELIGÊNCIA: Buscar Natureza/CC mais usados no histórico deste fornecedor ou mapeamento
       const nfs = S.nfs.filter(n => n.fornId === f.id);
-      let bestNat = f.natId, bestCC = f.ccId;
+      let bestNat = f.natId, bestCC = f.ccId, bestHist = '';
+
       if (nfs.length) {
         const countsN = {}, countsC = {};
         nfs.forEach(nx => {
           countsN[nx.natId] = (countsN[nx.natId] || 0) + 1;
           countsC[nx.ccId] = (countsC[nx.ccId] || 0) + 1;
         });
-        bestNat = Object.entries(countsN).sort((a, b) => b[1] - a[1])[0][0];
-        bestCC = Object.entries(countsC).sort((a, b) => b[1] - a[1])[0][0];
+        bestNat = parseInt(Object.entries(countsN).sort((a, b) => b[1] - a[1])[0][0]);
+        bestCC = parseInt(Object.entries(countsC).sort((a, b) => b[1] - a[1])[0][0]);
+      } else {
+        const sugg = getSupplierSuggestion(f.nome);
+        if (sugg) {
+          bestNat = sugg.natId;
+          bestCC = sugg.ccId;
+          bestHist = sugg.hist || '';
+        }
       }
 
       setTimeout(() => {
         document.getElementById('nf-nat').value = bestNat || '';
         document.getElementById('nf-cc').value = bestCC || '';
+        if (bestHist) sv('nf-hist', bestHist.replace('{NF}', g('nf-num') || '000').replace('{MES_ANO}', todayISO().slice(0, 7)));
       }, 50);
 
       document.getElementById('ac-dd').classList.remove('open');
