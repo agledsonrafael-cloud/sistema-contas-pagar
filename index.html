@@ -3682,35 +3682,6 @@
       const isTotalCollision = (total_dc_val === vb || total_dc_val === vl || (protocolValue > 0 && total_dc_val === protocolValue)) && total_dc_val > 50;
       dc = (total_dc_score > 10 && !isTotalCollision) ? total_dc_val : sumIndividualRet;
 
-      // 3. Motor Fiscal PF/PJ (V19.0)
-      let isSmartDc = false;
-      const resolvedDocLen = (f && f.doc) ? onlyDigits(f.doc).length : (docEmit ? docEmit.length : 0);
-      if (resolvedDocLen === 11) {
-        // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
-        const inssExpected = 0.11 * vb;
-
-        if (inssExpected > 0) {
-          // Se a leitura encontrou um total de descontos igual ao INSS, ok. Senão, força o INSS.
-          if (Math.abs(dc - inssExpected) > 0.05) {
-            dc = inssExpected;
-            isSmartDc = true; // Impede que a Trindade ou o Protocolo zere esse valor
-            addLog('info', `💡 CPF detectado: Retenção obrigatória de 11% INSS (R$ ${fn(dc)}) aplicada.`);
-          }
-        }
-      } else if (resolvedDocLen === 14) {
-        // REGRA PARA PESSOA JURÍDICA (CNPJ): Confiar na leitura inteligente
-        if (sumIndividualRet > 0 && Math.abs(sumIndividualRet - dc) > 0.05) {
-          // Se a soma das retenções individuais for diferente do 'Desconto Total' lido, 
-          // e o desconto total não fizer sentido, prefira a soma inteligente.
-          if (dc === 0 || dc === vb || dc === vl) {
-            dc = sumIndividualRet;
-            isSmartDc = true; // Impede que a Trindade ou o Protocolo zere esse valor
-            addLog('info', `💡 CNPJ detectado: Utilizando soma inteligente de retenções (R$ ${fn(dc)}).`);
-          }
-        }
-      }
-
-
       // 4. Lógica de Reconciliação de Trindade (Bruto, Líquido, Desconto)
       if (vl > 0 && dc > 0 && (vb === 0 || Math.abs(vb - vl) < 0.1)) {
         vb = vl + dc;
@@ -3719,12 +3690,7 @@
       } else if (vb > 0 && vl > 0) {
         // Se Bruto e Líquido existem e o desconto extraído não bate, confia na diferença entre eles
         if (Math.abs(vb - vl - dc) > 0.05) {
-          if (!isSmartDc) {
-            dc = Math.max(0, vb - vl);
-          } else {
-            // Se o desconto é inteligente (PF 11% ou Soma PJ), apossamos o líquido real em vez de confiar na leitura do PDF
-            vl = Math.max(0, vb - dc);
-          }
+          dc = Math.max(0, vb - vl);
         }
       } else if (vb > 0 && vl === 0 && dc === 0) {
         vl = vb;
@@ -3741,19 +3707,42 @@
       // V18.2: Âncora de Protocolo Mandatória (Líquido Master)
       if (protocolValue > 0 && Math.abs(vl - protocolValue) > 0.05) {
         if (Math.abs(vb - protocolValue) < 0.05) {
-          if (isSmartDc) {
-            addLog('warn', `⚠ Protocolo (R$ ${fn(protocolValue)}) informava o Bruto, mas os Descontos/Impostos foram mantidos.`);
-          } else {
-            vl = protocolValue; dc = 0;
-          }
+          vl = protocolValue; dc = 0;
         } else {
           vl = protocolValue; if (vb < vl) vb = vl;
-          // Se for Smart DC e a diferença bater, ok. Se não, sobrepõem.
-          if (!isSmartDc) {
-            dc = Math.max(0, vb - vl);
+          dc = Math.max(0, vb - vl);
+        }
+      }
+
+      // 3. Motor Fiscal PF/PJ (V19.0) - MOVIDO PARA O FIM (Garante VB real)
+      let isSmartDc = false;
+      const resolvedDocLen = (f && f.doc) ? onlyDigits(f.doc).length : (docEmit ? docEmit.length : 0);
+      if (resolvedDocLen === 11) {
+        // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
+        const inssExpected = 0.11 * vb;
+
+        if (inssExpected > 0) {
+          if (Math.abs(dc - inssExpected) > 0.05) {
+            dc = inssExpected;
+            isSmartDc = true; // Impede que a duplicação matemática zere
+            if (protocolValue > 0 && Math.abs(protocolValue - vb) < 0.05) {
+              addLog('warn', `⚠ Protocolo informou o Bruto, mas 11% de INSS foi retido.`);
+            }
+            addLog('info', `💡 CPF detectado: Retenção obrigatória de 11% INSS (R$ ${fn(dc)}) aplicada sobre Bruto.`);
+          }
+        }
+      } else if (resolvedDocLen === 14) {
+        // REGRA PARA PESSOA JURÍDICA (CNPJ): Confiar na leitura inteligente
+        if (sumIndividualRet > 0 && Math.abs(sumIndividualRet - dc) > 0.05) {
+          if (dc === 0 || dc === Math.max(0, vb - vl) || dc === vb || dc === vl) {
+            dc = sumIndividualRet;
+            isSmartDc = true;
+            addLog('info', `💡 CNPJ detectado: Utilizando soma inteligente de impostos e retenções (R$ ${fn(dc)}).`);
           }
         }
       }
+
+
 
       // V18.2: Escudo Anti-Duplicação Matemática (Fim do Valor Dobrado)
       if (Math.abs(vb - (vl * 2)) < 0.1 && Math.abs(dc - vl) < 0.1 && vl > 100) {
