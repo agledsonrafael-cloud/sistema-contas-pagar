@@ -3683,6 +3683,7 @@
       dc = (total_dc_score > 10 && !isTotalCollision) ? total_dc_val : sumIndividualRet;
 
       // 3. Motor Fiscal PF/PJ (V19.0)
+      let isSmartDc = false;
       if (docEmit && docEmit.length === 11) {
         // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
         const inssExpected = 0.11 * vb;
@@ -3691,6 +3692,7 @@
           // Se a leitura encontrou um total de descontos igual ao INSS, ok. Senão, força o INSS.
           if (Math.abs(dc - inssExpected) > 0.05) {
             dc = inssExpected;
+            isSmartDc = true; // Impede que a Trindade ou o Protocolo zere esse valor
             addLog('info', `💡 CPF detectado: Retenção obrigatória de 11% INSS (R$ ${fn(dc)}) aplicada.`);
           }
         }
@@ -3701,6 +3703,7 @@
           // e o desconto total não fizer sentido, prefira a soma inteligente.
           if (dc === 0 || dc === vb || dc === vl) {
             dc = sumIndividualRet;
+            isSmartDc = true; // Impede que a Trindade ou o Protocolo zere esse valor
             addLog('info', `💡 CNPJ detectado: Utilizando soma inteligente de retenções (R$ ${fn(dc)}).`);
           }
         }
@@ -3715,7 +3718,12 @@
       } else if (vb > 0 && vl > 0) {
         // Se Bruto e Líquido existem e o desconto extraído não bate, confia na diferença entre eles
         if (Math.abs(vb - vl - dc) > 0.05) {
-          dc = Math.max(0, vb - vl);
+          if (!isSmartDc) {
+            dc = Math.max(0, vb - vl);
+          } else {
+            // Se o desconto é inteligente (PF 11% ou Soma PJ), apossamos o líquido real em vez de confiar na leitura do PDF
+            vl = Math.max(0, vb - dc);
+          }
         }
       } else if (vb > 0 && vl === 0 && dc === 0) {
         vl = vb;
@@ -3732,16 +3740,24 @@
       // V18.2: Âncora de Protocolo Mandatória (Líquido Master)
       if (protocolValue > 0 && Math.abs(vl - protocolValue) > 0.05) {
         if (Math.abs(vb - protocolValue) < 0.05) {
-          vl = protocolValue; dc = 0;
+          if (isSmartDc) {
+            addLog('warn', `⚠ Protocolo (R$ ${fn(protocolValue)}) informava o Bruto, mas os Descontos/Impostos foram mantidos.`);
+          } else {
+            vl = protocolValue; dc = 0;
+          }
         } else {
           vl = protocolValue; if (vb < vl) vb = vl;
-          dc = Math.max(0, vb - vl);
+          // Se for Smart DC e a diferença bater, ok. Se não, sobrepõem.
+          if (!isSmartDc) {
+            dc = Math.max(0, vb - vl);
+          }
         }
       }
 
       // V18.2: Escudo Anti-Duplicação Matemática (Fim do Valor Dobrado)
       if (Math.abs(vb - (vl * 2)) < 0.1 && Math.abs(dc - vl) < 0.1 && vl > 100) {
-        vb = vl; dc = 0;
+        vb = vl;
+        if (!isSmartDc) dc = 0;
         addLog('warn', `⚠ Detetada duplicação matemática (R$ ${fn(vl)}). Ajustado.`);
       }
 
@@ -3884,26 +3900,31 @@
       dc += (taxesValidated.irrf + taxesValidated.csll + taxesValidated.pis + taxesValidated.cofins + taxesValidated.iss + taxesValidated.ret);
 
       // 3. Motor Fiscal PF/PJ (V19.0)
+      let isSmartDc = false;
       if (docEmit && docEmit.length === 11) {
         // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
         const inssExpected = 0.11 * vb;
         if (inssExpected > 0) {
           if (Math.abs(dc - inssExpected) > 0.05 && Math.abs(dc - (vDesc + inssExpected)) > 0.05) {
             dc = vDesc > 0 ? (vDesc + inssExpected) : inssExpected;
+            isSmartDc = true;
             addLog('info', `💡 CPF detectado no XML: Retenção obrigatória de 11% INSS (R$ ${fn(inssExpected)}) aplicada.`);
           }
         }
       }
 
-
       let vl = Math.max(0, vb - dc);
 
       // V18.2: Âncora de Protocolo para XML
       if (protocolValue > 0 && Math.abs(vl - protocolValue) > 0.05) {
-        addLog('info', `💡 XML conciliado com Protocolo: R$ ${fn(protocolValue)}`);
-        vl = protocolValue;
-        if (vb < vl) vb = vl;
-        dc = Math.max(0, vb - vl);
+        if (isSmartDc && Math.abs(vb - protocolValue) < 0.05) {
+          addLog('warn', `⚠ Protocolo (R$ ${fn(protocolValue)}) informava o Bruto, mas retenção de PF foi mantida.`);
+        } else {
+          addLog('info', `💡 XML conciliado com Protocolo: R$ ${fn(protocolValue)}`);
+          vl = protocolValue;
+          if (vb < vl) vb = vl;
+          if (!isSmartDc) dc = Math.max(0, vb - vl);
+        }
       }
       const detPag = xmlNode(doc, 'detPag');
       const tipo = mapTPagToTipo(xmlText(detPag, 'tPag'));
