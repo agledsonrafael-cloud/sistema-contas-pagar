@@ -3606,20 +3606,30 @@
       const isTotalCollision = (total_dc_val === vb || total_dc_val === vl || (protocolValue > 0 && total_dc_val === protocolValue)) && total_dc_val > 50;
       dc = (total_dc_score > 10 && !isTotalCollision) ? total_dc_val : sumIndividualRet;
 
-      // 3. Regra de Negócio Crítica: Pessoa Física (CPF) -> 11% INSS
+      // 3. Motor Fiscal PF/PJ (V19.0)
       if (docEmit && docEmit.length === 11) {
+        // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
         const inssExpected = 0.11 * vb;
-        const jaConstaInss = processedRetIdx.size > 0 && Array.from(processedRetIdx).some(idx => {
-          const mm = moneyMatches.find(m => m.index === idx);
-          const ctx = fullText.substring(Math.max(0, mm.index - 30), mm.index).toUpperCase();
-          return /INSS/i.test(ctx);
-        });
 
-        if (!jaConstaInss && inssExpected > 0) {
-          dc += inssExpected;
-          addLog('info', `💡 Aplicada retenção automática de 11% INSS (Pessoa Física).`);
+        if (inssExpected > 0) {
+          // Se a leitura encontrou um total de descontos igual ao INSS, ok. Senão, força o INSS.
+          if (Math.abs(dc - inssExpected) > 0.05) {
+            dc = inssExpected;
+            addLog('info', `💡 CPF detectado: Retenção obrigatória de 11% INSS (R$ ${fn(dc)}) aplicada.`);
+          }
+        }
+      } else if (docEmit && docEmit.length === 14) {
+        // REGRA PARA PESSOA JURÍDICA (CNPJ): Confiar na leitura inteligente
+        if (sumIndividualRet > 0 && Math.abs(sumIndividualRet - dc) > 0.05) {
+          // Se a soma das retenções individuais for diferente do 'Desconto Total' lido, 
+          // e o desconto total não fizer sentido, prefira a soma inteligente.
+          if (dc === 0 || dc === vb || dc === vl) {
+            dc = sumIndividualRet;
+            addLog('info', `💡 CNPJ detectado: Utilizando soma inteligente de retenções (R$ ${fn(dc)}).`);
+          }
         }
       }
+
 
       // 4. Lógica de Reconciliação de Trindade (Bruto, Líquido, Desconto)
       if (vl > 0 && dc > 0 && (vb === 0 || Math.abs(vb - vl) < 0.1)) {
@@ -3793,14 +3803,18 @@
       const taxesValidated = validateTaxRules(vb, taxesRaw, f?.regime || 'Simples Nacional');
       dc += (taxesValidated.irrf + taxesValidated.csll + taxesValidated.pis + taxesValidated.cofins + taxesValidated.iss + taxesValidated.ret);
 
-      // Retenção Automática INSS (11%) para Pessoa Física (CPF - 11 Dígitos)
+      // 3. Motor Fiscal PF/PJ (V19.0)
       if (docEmit && docEmit.length === 11) {
-        const jaTemInss = (xmlText(doc, 'vINSS') || toNum(xmlText(doc, 'vINSS')) > 0);
-        if (!jaTemInss) {
-          const retencaoInss = 0.11 * vb;
-          dc += retencaoInss;
+        // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
+        const inssExpected = 0.11 * vb;
+        if (inssExpected > 0) {
+          if (Math.abs(dc - inssExpected) > 0.05 && Math.abs(dc - (vDesc + inssExpected)) > 0.05) {
+            dc = vDesc > 0 ? (vDesc + inssExpected) : inssExpected;
+            addLog('info', `💡 CPF detectado no XML: Retenção obrigatória de 11% INSS (R$ ${fn(inssExpected)}) aplicada.`);
+          }
         }
       }
+
 
       let vl = Math.max(0, vb - dc);
 
