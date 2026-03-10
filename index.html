@@ -3096,8 +3096,7 @@
         setFStatus(f.name, 'fi-proc', 'LENDO...');
         addLog('info', '→ Analisando: ' + f.name);
         try {
-          const protocolVal = (match && match.valor) ? match.valor : 0;
-          const row = await extractFromFile(f, protocolVal);
+          const row = await extractFromFile(f, 0); // O valor do protocolo será injetado por dentro do parser
           if (!row) {
             setFStatus(f.name, 'fi-err', 'NÃO SUPORTADO');
             addLog('warn', '⚠ ' + f.name + ' ignorado (use XML da NFe para extração automática).');
@@ -3242,6 +3241,20 @@
       addLog('info', `Iniciando leitura inteligente da imagem via OCR...`);
       const { data: { text } } = await Tesseract.recognize(file, 'por', { logger: m => console.log(m) });
       return await parseTextToNf(text, file, protocolValue);
+    }
+
+    // V18.2: Helper para encontrar ancoragem de protocolo de forma segura pós-extração básica
+    function findProtocolMatch(nfNumStr, fileName, fornecedorNome) {
+      if (!protocolData || !protocolData.length) return null;
+      const fName = (fileName || '').toLowerCase();
+      const fForn = (fornecedorNome || '').toLowerCase();
+      const nfClean = (nfNumStr || '').replace(/\D/g, '');
+
+      let m = protocolData.find(p => p.nf && (nfClean.includes(p.nf) || p.nf.includes(nfClean)));
+      if (!m) {
+        m = protocolData.find(p => p.razao && (fName.includes(p.razao.toLowerCase()) || fForn.includes(p.razao.toLowerCase()) || p.razao.toLowerCase().includes(fForn)));
+      }
+      return m;
     }
 
     async function parseTextToNf(fullText, file, protocolValue = 0) {
@@ -3487,6 +3500,12 @@
       }
 
       let f = findSupplierByDocOrName(docEmit, nomeEmit);
+
+      // V18.2: 📥 Auto-descobrir Âncora de Protocolo (Resolvendo 'match is not defined')
+      if (protocolValue === 0) {
+        const pMatch = findProtocolMatch(nfNum, file.name, nomeEmit);
+        if (pMatch && pMatch.valor) protocolValue = pMatch.valor;
+      }
 
       // ── Motor Analítico de Valores V17.0 (Precision Retention System) ──
       let vb_score = -1, vb_val = 0;
@@ -3747,6 +3766,13 @@
       // Não chamamos a API externa aqui para poupar requests (O XML já envia a Razão bem estruturada 99% das vezes).
       // Mas checamos nosso BD interno.
       let f = findSupplierByDocOrName(docEmit, nomeEmit);
+
+      // V18.2: 📥 Auto-descobrir Âncora de Protocolo (Resolvendo 'match is not defined')
+      if (protocolValue === 0) {
+        const pMatch = findProtocolMatch(nfNumRaw, file.name, nomeEmit);
+        if (pMatch && pMatch.valor) protocolValue = pMatch.valor;
+      }
+
       const vNf = toNum(xmlText(icmsTot, 'vNF'));
       const vProd = toNum(xmlText(icmsTot, 'vProd') || xmlText(doc, 'vServ') || xmlText(doc, 'vServicos'));
       const vDesc = toNum(xmlText(icmsTot, 'vDesc'));
