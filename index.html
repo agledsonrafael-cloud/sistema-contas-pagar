@@ -2750,7 +2750,10 @@
         S.nfs = nfRows.map(mapNfFromDb);
         S.fp = fpRows.map(mapFpFromDb);
         importCount = S.nfs.filter(n => n.origem === 'IMPORTADO').length;
+        // V20.0: Inteligência Secundária via Sheets
+        await fetchGoogleSheetIntelligence();
         // Cache local
+
         saveStateLocal(true);
       } catch (err) {
         console.warn('Falha ao carregar do Supabase, usando cache local:', err);
@@ -2779,9 +2782,55 @@
     let acIdx = -1, acRes = [];
     let uploadedFiles = [], extractedRows = [], importCount = 0;
 
-    const S = { cc: [], nat: [], forn: [], nfs: [], fp: [] };
+    const S = { cc: [], nat: [], forn: [], nfs: [], fp: [], intel: [] };
     const STORAGE_KEY = 'contas-pagar::v3';
     let persistWarned = false;
+
+    // ══ V20.0 INTELLIGENCE ENGINE (GOOGLE SHEETS) ══
+    async function fetchGoogleSheetIntelligence() {
+      try {
+        const url = 'https://docs.google.com/spreadsheets/d/1LPjBJwVQ4ziMQleAQfuajU7NnLc7s_Ha/export?format=csv&gid=2079019333';
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('Não foi possível acessar a planilha.');
+        const csvText = await res.text();
+        const lines = csvText.split('\n');
+
+        S.intel = [];
+
+        // Formato Histórico Alvo (Índice 12 / Col M): NATUREZA NOME - FORNECEDOR NOME - NF XXX - HISTÓRICO
+        // Ex: MAT. LABORATORIO- ZOETIS COMECIO E DISTRIBUICAO LTDA- NF- 110941- REAGENTES PARA O LABORATORIO
+        lines.forEach((line, idx) => {
+          if (idx === 0 || !line.trim()) return;
+          // Tratamento rudimentar de CSV split considerando aspas
+          // Regex robusta para capturar a coluna 12 mesmo com vírgulas dentro de aspas
+          const cols = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+          if (cols.length >= 13) {
+            let histRaw = (cols[12] || '').replace(/^"|"$/g, '').trim(); // Coluna M
+            if (!histRaw) return;
+
+            // Regex V20: Pega Natureza, Fornecedor e o Restante
+            const match = histRaw.match(/^([^-]+)\s*-\s*(.+?)\s*-\s*(?:NF|NOTA)[\s-]*\d+[-\s]*(.+)$/i);
+            if (match) {
+              const natNome = match[1].trim();
+              const fornNome = match[2].trim();
+              const desc = match[3].trim();
+
+              if (fornNome.length > 3) {
+                // Tenta encontrar a natId correspondente no banco (fuzzy)
+                let foundNatId = null;
+                const natObj = S.nat.find(n => natNome.toUpperCase().includes(n.nome.toUpperCase()) || n.nome.toUpperCase().includes(natNome.toUpperCase()));
+                if (natObj) foundNatId = natObj.id;
+
+                S.intel.push({ fornPattern: fornNome.toUpperCase(), natId: foundNatId, natNome: natNome, descPattern: desc });
+              }
+            }
+          }
+        });
+        console.log(`[Intel V20.0] ${S.intel.length} padrões de histórico carregados da planilha.`);
+      } catch (e) {
+        console.warn('Falha ao sincronizar Inteligência Secundária do Google Sheets:', e);
+      }
+    }
 
     // ══ INIT ══
     async function init() {
@@ -2827,7 +2876,7 @@
       }
     }
     function renderAll() { renderCCList(); renderNatList(); renderFornList(); renderNFTable(); renderDashboard(); document.getElementById('bc-nf').textContent = S.nfs.length; }
-    function loadStateLocal() {
+    async function loadStateLocal() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) {
@@ -2837,6 +2886,9 @@
           importCount = data.importCount || 0;
         }
       } catch (e) { /* ignore */ }
+
+      // V20.0: Mesmo offline do DB, tenta puxar inteligência do Sheet se tiver net
+      await fetchGoogleSheetIntelligence();
     }
 
     // ══ NAV ══
@@ -3075,9 +3127,19 @@
     function getSupplierSuggestion(name) {
       if (!name) return null;
       const q = name.toUpperCase();
-      // Prioridade 1: Mapeamento direto da planilha (FP)
+      // Prioridade 1: Mapeamento direto da planilha BD (FP)
       const fp = S.fp.find(x => q.includes(x.label.toUpperCase()) || x.label.toUpperCase().includes(q));
       if (fp) return { natId: fp.natId, ccId: fp.ccId, hist: fp.hist };
+
+      // Prioridade 2: Inteligência Secundária do Google Sheets (V20.0)
+      if (S.intel && S.intel.length > 0) {
+        // Encontra histórico onde o Fornecedor bate
+        const intelMatch = S.intel.find(x => q.includes(x.fornPattern) || x.fornPattern.includes(q));
+        if (intelMatch) {
+          return { natId: intelMatch.natId, ccId: null, hist: intelMatch.descPattern };
+        }
+      }
+
       return null;
     }
 
@@ -3409,7 +3471,7 @@
           { keys: ['honorario', 'advogado', 'juridico', 'contabil'], nat: 'HONORÁRIOS', cc: 'ADMINISTRATIVO' }
         ];
 
-        let foundNat = null, foundCc = null;
+        let foundNat = null, foundCc = null, histSugg = null;
         for (const rule of rules) {
           if (rule.keys.some(k => text.includes(k))) {
             const nat = S.nat.find(n => n.nome.toUpperCase().includes(rule.nat));
@@ -3419,7 +3481,21 @@
             if (foundNat || foundCc) break;
           }
         }
-        return { natId: foundNat, ccId: foundCc };
+
+        // V20.0: Inteligência Adicional via Sheets (Procura descrições semelhantes em outros fornecedores)
+        if (!foundNat && S.intel && S.intel.length > 0) {
+          const words = text.split(/[\s,.-]+/).filter(w => w.length > 5 && !['SERVICO', 'REFERENTE', 'PAGAMENTO'].includes(w.toUpperCase()));
+          for (const word of words) {
+            const match = S.intel.find(i => i.descPattern.toLowerCase().includes(word.toLowerCase()));
+            if (match && match.natId) {
+              foundNat = match.natId;
+              histSugg = match.descPattern; // Sugere o histórico semelhante
+              break;
+            }
+          }
+        }
+
+        return { natId: foundNat, ccId: foundCc, histSugg };
       }
 
       // ── Extrair nome do fornecedor (FALLBACK HEURÍSTICO) ──
@@ -3722,6 +3798,10 @@
         const suggest = suggestClassification(servicoExtraido || file.name);
         if (!ccIdFinal) ccIdFinal = suggest.ccId;
         if (!natIdFinal) natIdFinal = suggest.natId;
+        // V20.0: Sugerir histórico semelhante
+        if (suggest.histSugg && (!f || histFinal === 'Importado de PDF' || histFinal === servicoExtraido)) {
+          histFinal = suggest.histSugg;
+        }
       }
 
       // Se encontramos o fornecedor mas o histórico está genérico, tenta melhorar
@@ -3843,15 +3923,18 @@
       }
       let finalCcId = smartHist.ccId || f?.ccId || null;
       let finalNatId = smartHist.natId || f?.natId || null;
+      let finalHist = servicoXml || smartHist.hist || 'Importado de XML NFe';
 
       // V14.0: Inteligência Adicional XML - Sugestão por Palavra-Chave (Keyword Matcher)
       if (!finalCcId || !finalNatId) {
         const suggest = suggestClassification(servicoXml || file.name);
         if (!finalCcId) finalCcId = suggest.ccId;
         if (!finalNatId) finalNatId = suggest.natId;
+        // V20.0: Sugerir histórico semelhante para XML
+        if (suggest.histSugg && (!f || finalHist.includes('Importado'))) {
+          finalHist = suggest.histSugg;
+        }
       }
-
-      let finalHist = servicoXml || smartHist.hist || 'Importado de XML NFe';
 
       return {
         arquivo: file.name,
