@@ -3096,7 +3096,8 @@
         setFStatus(f.name, 'fi-proc', 'LENDO...');
         addLog('info', '→ Analisando: ' + f.name);
         try {
-          const row = await extractFromFile(f);
+          const protocolVal = (match && match.valor) ? match.valor : 0;
+          const row = await extractFromFile(f, protocolVal);
           if (!row) {
             setFStatus(f.name, 'fi-err', 'NÃO SUPORTADO');
             addLog('warn', '⚠ ' + f.name + ' ignorado (use XML da NFe para extração automática).');
@@ -3183,15 +3184,15 @@
       }
     }
 
-    async function extractFromFile(file) {
+    async function extractFromFile(file, protocolValue = 0) {
       const nm = file.name.toLowerCase();
-      if (nm.endsWith('.xml')) return await extractFromXml(file);
-      if (nm.endsWith('.pdf')) return await extractFromPdf(file);
-      if (['.png', '.jpg', '.jpeg', '.webp'].some(ext => nm.endsWith(ext))) return await extractFromImage(file);
+      if (nm.endsWith('.xml')) return await extractFromXml(file, protocolValue);
+      if (nm.endsWith('.pdf')) return await extractFromPdf(file, protocolValue);
+      if (['.png', '.jpg', '.jpeg', '.webp'].some(ext => nm.endsWith(ext))) return await extractFromImage(file, protocolValue);
       return null;
     }
 
-    async function extractFromPdf(file) {
+    async function extractFromPdf(file, protocolValue = 0) {
       if (!window.pdfjsLib) throw new Error('PDF.js não carregado');
       const buf = await file.arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
@@ -3233,17 +3234,17 @@
         }
         fullText = ocrText;
       }
-      return await parseTextToNf(fullText, file);
+      return await parseTextToNf(fullText, file, protocolValue);
     }
 
-    async function extractFromImage(file) {
+    async function extractFromImage(file, protocolValue = 0) {
       if (!window.Tesseract) throw new Error('OCR (Tesseract) não carregado');
       addLog('info', `Iniciando leitura inteligente da imagem via OCR...`);
       const { data: { text } } = await Tesseract.recognize(file, 'por', { logger: m => console.log(m) });
-      return await parseTextToNf(text, file);
+      return await parseTextToNf(text, file, protocolValue);
     }
 
-    async function parseTextToNf(fullText, file) {
+    async function parseTextToNf(fullText, file, protocolValue = 0) {
 
       // ── Extração via Nome do Arquivo (V12.0 - Prioridade do Usuário) ──
       let nfNum = '';
@@ -3546,6 +3547,12 @@
         if (b_p > vb_score) { vb_score = b_p; vb_val = item.val; }
         if (l_p > vl_score) { vl_score = l_p; vl_val = item.val; }
         if (t_dc_p > total_dc_score) { total_dc_score = t_dc_p; total_dc_val = item.val; }
+
+        // V18.1: Âncora de Protocolo (Protocol Matching Anchor)
+        if (protocolValue > 0 && Math.abs(item.val - protocolValue) < 0.05) {
+          l_p += 100; // Boost massivo para o valor do protocolo ser o Líquido
+          if (l_p > vl_score) { vl_score = l_p; vl_val = item.val; }
+        }
       });
 
       // ── Consolidação Analítica V17.1 (Stable Value Extraction + PF INSS Rule) ──
@@ -3575,7 +3582,9 @@
       });
 
       // 2. Determinar Desconto Total (dc)
-      dc = (total_dc_score > 10) ? total_dc_val : sumIndividualRet;
+      // V18.1: Escudo de Colisão Global no Total Discount
+      const isTotalCollision = (total_dc_val === vb || total_dc_val === vl) && total_dc_val > 50;
+      dc = (total_dc_score > 10 && !isTotalCollision) ? total_dc_val : sumIndividualRet;
 
       // 3. Regra de Negócio Crítica: Pessoa Física (CPF) -> 11% INSS
       if (docEmit && docEmit.length === 11) {
@@ -3612,6 +3621,20 @@
       if (vl === 0 && vb === 0 && moneyMatches.length > 0) {
         vl = moneyMatches[0].val;
         vb = vl;
+      }
+
+      // 5. Verificação Final via Protocolo
+      if (protocolValue > 0 && Math.abs(vl - protocolValue) > 0.05) {
+        // Se o valor extraído é EXATAMENTE o dobro do protocolo, muito provavelmente houve colisão
+        if (Math.abs(vl - (protocolValue * 2)) < 0.1 || Math.abs(vb - (protocolValue * 2)) < 0.1) {
+          addLog('warn', `⚠ Detectada colisão de valores. Ajustando para o valor do protocolo: R$ ${fn(protocolValue)}`);
+          vb = protocolValue;
+          vl = protocolValue;
+          dc = 0;
+        } else if (Math.abs(vb - protocolValue) < 0.05) {
+          // Se o Bruto bate com o protocolo mas o líquido não (devido a impostos), confia no líquido extraído
+          // Mas em geral, o protocolo representa o valor a pagar (Líquido)
+        }
       }
 
       vl = Math.max(0, vb - dc);
@@ -3695,7 +3718,7 @@
       };
     }
 
-    async function extractFromXml(file) {
+    async function extractFromXml(file, protocolValue = 0) {
       const txt = await file.text();
       const doc = new DOMParser().parseFromString(txt, 'application/xml');
       if (doc.querySelector('parsererror')) throw new Error('XML inválido');
