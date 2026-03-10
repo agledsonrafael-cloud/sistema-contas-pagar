@@ -2911,73 +2911,140 @@
     }
     function setFStatus(name, cls, label) { const el = document.getElementById('st-' + name.replace(/\W/g, '_')); if (el) { el.className = 'fi-status ' + cls; el.textContent = label } }
 
-    // ══ PROTOCOL PARSER ══
+    // ══ PROTOCOL PARSER V2.0 ══
     let protocolData = [];
     function parseProtocol() {
       const text = document.getElementById('protocol-text').value.trim();
       const stats = document.getElementById('protocol-stats');
-      if (!text) { protocolData = []; stats.style.display = 'none'; return; }
+      if (!text) { protocolData = []; if (stats) stats.style.display = 'none'; return; }
 
-      const lines = text.split('\n');
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
       const rows = [];
 
-      lines.forEach(line => {
-        // Regex para Valor (com ou sem R$)
-        const moneyMatch = line.match(/(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2})/);
-        // Regex para NF (3 a 9 dígitos isolados)
-        const nfMatch = line.match(/(?:\s|^)(\d{3,9})(?:\s|$)/);
+      // Mapeamento de cabeçalhos comuns
+      const headersMap = {
+        nf: [/n[oºp\.]?\s*(?:nf|doc|prot[o]?)/i, /not[a]?\s*fisc[a]?l/i, /n[f]e/i, /\bnf\b/i, /n[ºo°]\.?/i],
+        valor: [/valor/i, /vlr/i, /reais/i, /pre[çc]o/i, /total/i],
+        razao: [/raz[ãa]o\s*social/i, /fornecedor/i, /nome/i, /prestador/i, /emitente/i, /empresa/i],
+        desc: [/descri[çc][ãa]o/i, /servi[çc]o/i, /hist[óo]rico/i, /item/i, /detalhe/i],
+        data: [/data/i, /emiss[ãa]o/i, /compet[êe]ncia/i, /vencimento/i]
+      };
 
-        if (moneyMatch) {
-          const valorStr = moneyMatch[1];
-          const valor = toNum(valorStr);
-          let nf = nfMatch ? nfMatch[1] : '';
+      let colMapping = null;
 
-          let razao = '';
-          let desc = '';
-
-          // Tentar extrair partes baseadas nas posições
-          const valIdx = line.indexOf(moneyMatch[0]);
-          const nfIdx = nfMatch ? line.indexOf(nfMatch[1]) : -1;
-
-          // Se NF vem antes do Valor
-          if (nfIdx !== -1 && nfIdx < valIdx) {
-            // Razão social costuma vir depois do valor no formato do usuário
-            // Mas no exemplo dele: [NF] [VALOR] [RAZÃO] [DESC]
-            const afterValue = line.substring(valIdx + moneyMatch[0].length).trim();
-            const parts = afterValue.split(/\s{2,}|(?:\s-\s)/); // Split por 2+ espaços ou traço
-            if (parts.length >= 2) {
-              razao = parts[0].trim();
-              desc = parts.slice(1).join(' ').trim();
-            } else {
-              // Fallback: tenta separar maiúsculas (Razão) de minúsculas (Desc)
-              const matchRS = afterValue.match(/^([^a-z]+)\s+(.+)$/);
-              if (matchRS) {
-                razao = matchRS[1].trim();
-                desc = matchRS[2].trim();
-              } else {
-                razao = afterValue;
+      // Tentar detectar se a primeira ou segunda linha é um cabeçalho
+      for (let i = 0; i < Math.min(2, lines.length); i++) {
+        const parts = lines[i].split(/\t|\s{2,}/); // Split por tab ou 2+ espaços
+        if (parts.length >= 2) {
+          let foundCount = 0;
+          let tempMapping = {};
+          parts.forEach((p, idx) => {
+            for (let k in headersMap) {
+              if (headersMap[k].some(reg => reg.test(p))) {
+                tempMapping[k] = idx;
+                foundCount++;
+                break;
               }
             }
-          } else {
-            // Formato mais livre
-            razao = line.replace(moneyMatch[0], '').replace(nf, '').trim().split(/\s{2,}/)[0];
-            desc = line.split(razao)[1]?.trim() || '';
-          }
-
-          if (nf || valor) {
-            rows.push({ nf, valor, razao, desc });
+          });
+          if (foundCount >= 2) { // Se detectou 2 ou mais cabeçalhos, considera que achou
+            colMapping = tempMapping;
+            lines.splice(i, 1); // Remove a linha de cabeçalho
+            break;
           }
         }
-      });
+      }
+
+      const avgCols = lines.slice(0, 10).reduce((acc, l) => acc + (l.split(/\t|\s{2,}/).length), 0) / Math.min(10, lines.length || 1);
+
+      if (avgCols < 1.5 && lines.length > 3) {
+        // ── MODO VERTICAL V3.0 (Estado por Tipo e Posição) ──
+        let cur = { nf: '', valor: 0, razao: '', desc: '', data: '' };
+        const pushCur = () => { if (cur.razao || cur.nf || cur.valor) rows.push({ ...cur, desc: cur.desc || cur.razao }); cur = { nf: '', valor: 0, razao: '', desc: '', data: '' }; };
+
+        lines.forEach(l => {
+          const isDate = /\d{2}\/\d{2}\/\d{2,4}/.test(l);
+          const isMoney = /(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2}/.test(l);
+          const isNumeric = /^\d+$/.test(l);
+          // Nome: Tudo maiúsculo, pelo menos uma letra, sem minúsculas, não é data/moeda
+          const isNameCandidate = l.length > 3 && l === l.toUpperCase() && /[A-Z]/.test(l) && !/[a-z]/.test(l) && !isDate && !isMoney;
+
+          // Delimitador de Registro: Se já temos os campos principais e aparece algo que reseta o ciclo
+          if ((isDate && cur.data) || (isMoney && cur.valor) || (isNameCandidate && cur.razao)) pushCur();
+
+          if (isDate) cur.data = l;
+          else if (isMoney) cur.valor = toNum(l);
+          else if (isNumeric) {
+            // Heurística de Posição: 
+            // - Se não temos Razão e o número é pequeno, é o índice (ignorar).
+            // - Se já temos Razão e o número é o primeiro numérico após ela, é a NF.
+            if (cur.razao && !cur.nf) cur.nf = l;
+            // Se for o índice (sem razão ainda), apenas deixamos passar para não poluir
+          } else if (l.length > 3) {
+            // Heurística de Nome vs Descrição:
+            // - No vertical, o Nome (Razão) costuma vir antes da Descrição.
+            if (!cur.razao) cur.razao = l;
+            else cur.desc = (cur.desc ? cur.desc + ' ' : '') + l;
+          }
+        });
+        pushCur();
+      } else {
+        // ── MODO HORIZONTAL (Tabela Padrão) ──
+        lines.forEach(line => {
+          let parts = line.split(/\t|\s{2,}/);
+
+          if (parts.length < 2) {
+            const mMoney = line.match(/(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2})/);
+            const mNF = line.match(/(?:\s|^)(\d{3,9})(?:\s|$)/);
+            if (mMoney) {
+              const val = toNum(mMoney[1]);
+              const nf = mNF ? mNF[1] : '';
+              let rest = line.replace(mMoney[0], '').replace(nf, '').trim();
+              const splitMatch = rest.match(/^([^a-z]+)\s+(.+)$/);
+              rows.push({
+                nf, valor: val,
+                razao: (splitMatch ? splitMatch[1] : rest).trim(),
+                desc: (splitMatch ? splitMatch[2] : '').trim()
+              });
+              return;
+            }
+          }
+
+          if (parts.length >= 2) {
+            let nf = '', valor = 0, razao = '', desc = '', data = '';
+            if (colMapping) {
+              if (colMapping.nf !== undefined) nf = parts[colMapping.nf]?.replace(/\D/g, '') || '';
+              if (colMapping.valor !== undefined) valor = toNum(parts[colMapping.valor]);
+              if (colMapping.razao !== undefined) razao = parts[colMapping.razao]?.trim() || '';
+              if (colMapping.desc !== undefined) desc = parts[colMapping.desc]?.trim() || '';
+              if (colMapping.data !== undefined) data = parts[colMapping.data]?.trim() || '';
+            } else {
+              parts.forEach(p => {
+                p = p.trim(); if (!p) return;
+                if (/(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2}/.test(p)) valor = toNum(p);
+                else if (/^\d{3,9}$/.test(p)) nf = p;
+                else if (/\d{2}\/\d{2}\/\d{2,4}/.test(p)) data = p;
+                else if (p.length > 3) {
+                  if (!razao) razao = p;
+                  else desc += (desc ? ' ' : '') + p;
+                }
+              });
+            }
+            if (valor || nf) rows.push({ nf, valor, razao, desc: desc || razao, data });
+          }
+        });
+      }
 
       protocolData = rows;
-      if (rows.length) {
-        stats.textContent = `✅ Detectados ${rows.length} itens no protocolo.`;
-        stats.style.display = 'block';
-        toast(`Protocolo: ${rows.length} itens encontrados.`);
-      } else {
-        stats.textContent = `❌ Nenhum item detectado. Verifique o formato.`;
-        stats.style.display = 'block';
+      if (stats) {
+        if (rows.length) {
+          stats.textContent = `✅ Detectados ${rows.length} itens no protocolo.`;
+          stats.style.display = 'block';
+          toast(`Protocolo: ${rows.length} itens encontrados.`);
+        } else {
+          stats.textContent = `❌ Nenhum item detectado. Verifique o formato.`;
+          stats.style.display = 'block';
+        }
       }
     }
 
@@ -3036,20 +3103,42 @@
             continue;
           }
 
-          // --- CONCILIAÇÃO COM PROTOCOLO E MAPEAMENTO HISTÓRICO ---
+          // --- CONCILIAÇÃO COM PROTOCOLO E MAPEAMENTO HISTÓRICO V2.0 ---
           if (protocolData.length) {
             const fileName = f.name.toLowerCase();
-            let match = protocolData.find(p => p.nf && (fileName.includes(p.nf) || row.nfNum.includes(p.nf)));
+            const rowFornClean = row.fornNome.toLowerCase();
+            const rowNFNum = row.nfNum.replace(/\D/g, '');
+
+            // 1. Tentar match por NF (O mais preciso)
+            let match = protocolData.find(p => p.nf && (rowNFNum.includes(p.nf) || p.nf.includes(rowNFNum)));
+
+            // 2. Tentar match por Razão Social (Fuzzy match)
             if (!match) {
-              match = protocolData.find(p => p.razao && (fileName.includes(p.razao.toLowerCase()) || row.fornNome.toLowerCase().includes(p.razao.toLowerCase())));
+              match = protocolData.find(p => {
+                if (!p.razao) return false;
+                const pRazao = p.razao.toLowerCase();
+                return fileName.includes(pRazao) || rowFornClean.includes(pRazao) || pRazao.includes(rowFornClean);
+              });
             }
+
+            // 3. Tentar match por Valor (Último recurso se houver apenas um item com aquele valor)
+            if (!match) {
+              const sameValueItems = protocolData.filter(p => Math.abs(toNum(row.vl) - p.valor) < 0.05);
+              if (sameValueItems.length === 1) match = sameValueItems[0];
+            }
+
             if (match) {
               if (match.desc) {
-                row.protoDesc = match.desc; // Guarda a descrição original do protocolo
-                row.hist = match.desc;
+                row.protoDesc = match.desc;
+                row.hist = match.desc; // Prioriza a descrição do protocolo
               }
-              if (Math.abs(toNum(row.vl) - match.valor) > 0.01) {
-                addLog('warn', `⚠ Valor divergente em ${f.name}: PDF(R$ ${row.vl}) vs Protocolo(R$ ${fn(match.valor)})`);
+              if (match.nf && !row.nfNum.includes(match.nf)) {
+                // Se o protocolo tem NF e o arquivo não, ou divergem levemente, podemos confiar no protocolo
+                if (!row.nfNum || row.nfNum === 'NF S/N') row.nfNum = `NF ${match.nf}`;
+              }
+
+              if (Math.abs(toNum(row.vl) - match.valor) > 0.05) {
+                addLog('warn', `⚠ Valor divergente em ${f.name}: Extraído(R$ ${row.vl}) vs Protocolo(R$ ${fn(match.valor)})`);
               } else {
                 addLog('ok', `✨ Conciliado com Protocolo: ${f.name}`);
               }
@@ -3398,24 +3487,28 @@
 
       let f = findSupplierByDocOrName(docEmit, nomeEmit);
 
-      // ── Motor Analítico de Valores V16.4 (Granular Retention System) ──
+      // ── Motor Analítico de Valores V17.0 (Precision Retention System) ──
       let vb_score = -1, vb_val = 0;
       let vl_score = -1, vl_val = 0;
-      let total_dc_score = -1, total_dc_val = 0; // Para quando a nota já traz um "Total de Retenções"
+      let total_dc_score = -1, total_dc_val = 0;
 
       const moneyMatches = [];
-      const mPattern = /(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2})|(?:\s|^)(\d{1,7}\.\d{2})(?:\s|$)/g;
+      const mPattern = /(?:R\$\s*)?(\d+(?:\.\d{3})*,\d{2})|(?:\s|^)(\d{1,7}\.\d{2})(?:\s|$)/g;
       let m;
       while ((m = mPattern.exec(fullText)) !== null) {
         const val = toNum(m[0]);
-        if (val > 0.05 && val < 9999999) moneyMatches.push({ val, index: m.index, text: m[0] });
+        if (val > 0.05 && val < 9999999) {
+          // Evita duplicatas exatas na mesma posição
+          if (!moneyMatches.some(mm => mm.val === val && Math.abs(mm.index - m.index) < 5)) {
+            moneyMatches.push({ val, index: m.index, text: m[0] });
+          }
+        }
       }
 
-      // Rótulos categorizados
       const keys = {
-        bruto: [/Valor\s+(?:Bruto|Servi[çc]os?|Produtos?)/i, /V(?:\.\s*)?(?:Prod|Bruto|Serv)/i, /Total\s+Bruto/i, /Base\s+de\s+C[aá]lculo/i],
-        liquido: [/Valor\s+L[ií]quido/i, /V(?:\.\s*)?L[ií]q/i, /Total\s+a\s+Pagar/i, /Valor\s+da\s+Nota/i, /Total\s+(?:da\s+)?Nota/i, /L[ií]quido\s+da\s+Nota/i],
-        total_dc: [/Total\s+(?:de\s+)?Reten[çc][õo]es/i, /Total\s+Dedu[çc][õo]es/i, /Valor\s+Total\s+Retido/i],
+        bruto: [/Valor\s+(?:dos?\s+)?Servi[çc]os?/i, /Valor\s+Bruto/i, /V(?:\.\s*)?(?:Prod|Bruto|Serv)/i, /Total\s+Bruto/i, /Base\s+de\s+C[aá]lculo/i, /Valor\s+Total\s+da\s+Nota/i],
+        liquido: [/Valor\s+L[ií]quido/i, /(?:Total|Valor)\s+a\s+Pagar/i, /V(?:\.\s*)?L[ií]q/i, /Total\s+L[ií]quido/i, /(?:Total|Valor)\s+(?:da\s+)?Fatura/i, /L[ií]quido\s+da\s+Nota/i],
+        total_dc: [/Total\s+(?:de\s+)?Reten[çc][õo]es/i, /Total\s+Dedu[çc][õo]es/i, /Valor\s+Total\s+Retido/i, /Soma\s+das\s+Reten[çc][õo]es/i],
         retencoes: [
           { name: 'ISS', pattern: /ISS(?:QN)?(?:\s+Retido)?/i },
           { name: 'IRRF', pattern: /IRRF?/i },
@@ -3429,75 +3522,98 @@
         ]
       };
 
-      const foundRetentions = []; // Para armazenar retenções individuais e somá-las
-
       moneyMatches.forEach(item => {
-        const context = fullText.substring(Math.max(0, item.index - 60), item.index);
+        const context = fullText.substring(Math.max(0, item.index - 60), item.index + 20).toUpperCase();
 
         let b_p = 0, l_p = 0, t_dc_p = 0;
-        keys.bruto.forEach(p => { if (p.test(context)) b_p += 10; });
-        keys.liquido.forEach(p => { if (p.test(context)) l_p += 15; });
-        keys.total_dc.forEach(p => { if (p.test(context)) t_dc_p += 12; });
 
-        // Identificação de retenções individuais
-        keys.retencoes.forEach(ret => {
-          if (ret.pattern.test(context)) {
-            // Verifica se o valor faz sentido como retenção (geralmente menor que o bruto)
-            // Mas aqui apenas marcamos para soma posterior
-            foundRetentions.push({ name: ret.name, val: item.val, score: 10 });
-          }
-        });
+        // Pesos específicos: Serviço e Líquido ganham score máximo
+        if (/VALOR\s+(DOS?\s+)?SERVIÇOS?/i.test(context)) b_p += 40;
+        if (/VALOR\s+LÍQUIDO/i.test(context)) l_p += 45;
 
-        if (item.val === Math.max(...moneyMatches.map(mm => mm.val))) { b_p += 5; l_p += 5; }
+        keys.bruto.forEach(p => { if (p.test(context)) b_p += 20; });
+        keys.liquido.forEach(p => { if (p.test(context)) l_p += 25; });
+        keys.total_dc.forEach(p => { if (p.test(context)) t_dc_p += 15; });
+
+        // Heurística de posição
+        if (vb_val > 0 && item.index > moneyMatches.find(mm => mm.val === vb_val)?.index) l_p += 5;
+
+        if (item.val === Math.max(...moneyMatches.map(mm => mm.val))) {
+          b_p += 10;
+          l_p += 5;
+        }
 
         if (b_p > vb_score) { vb_score = b_p; vb_val = item.val; }
         if (l_p > vl_score) { vl_score = l_p; vl_val = item.val; }
         if (t_dc_p > total_dc_score) { total_dc_score = t_dc_p; total_dc_val = item.val; }
       });
 
-      // ── Consolidação Analítica V16.5 (Stable Value Extraction) ──
+      // ── Consolidação Analítica V17.1 (Stable Value Extraction + PF INSS Rule) ──
       let vb = vb_val, vl = vl_val, dc = 0;
 
-      // Cálculo do Desconto (dc)
-      // Se encontramos um "Total de Retenções" confiável, ele tem prioridade
-      // 1. Somatória de retenções
-      let sumIndividual = 0;
-      const processedValues = new Set();
-      keys.retencoes.forEach(ret => {
-        const match = moneyMatches.find(mm => {
-          const ctx = fullText.substring(Math.max(0, mm.index - 40), mm.index);
-          return ret.pattern.test(ctx);
+      // Desempate: Se o mesmo valor foi pego para Bruto e Líquido, resolve pelo maior score
+      if (vb === vl && vb > 0) {
+        if (vb_score >= vl_score) vl = 0;
+        else vb = 0;
+      }
+
+      // 1. Somatória de retenções individuais
+      let sumIndividualRet = 0;
+      const processedRetIdx = new Set();
+      keys.retencoes.forEach(retType => {
+        const bestMatch = moneyMatches.find(mm => {
+          const ctx = fullText.substring(Math.max(0, mm.index - 40), mm.index + 10).toUpperCase();
+          // V17.2: Impedir colisão - Valor de retenção não pode ser o mesmo do Bruto ou Líquido extraído anteriormente
+          // a menos que o score de retenção seja muito alto ou o valor seja muito pequeno (< 50)
+          const isCollision = (mm.val === vb || mm.val === vl) && mm.val > 50;
+          return retType.pattern.test(ctx) && !processedRetIdx.has(mm.index) && !isCollision;
         });
-        if (match && !processedValues.has(match.index)) {
-          sumIndividual += match.val;
-          processedValues.add(match.index);
+        if (bestMatch && bestMatch.val < Math.max(vb, vl) * 0.5) { // Retenção raramente passa de 50%
+          sumIndividualRet += bestMatch.val;
+          processedRetIdx.add(bestMatch.index);
         }
       });
 
-      dc = (total_dc_score > 10) ? total_dc_val : sumIndividual;
+      // 2. Determinar Desconto Total (dc)
+      dc = (total_dc_score > 10) ? total_dc_val : sumIndividualRet;
 
+      // 3. Regra de Negócio Crítica: Pessoa Física (CPF) -> 11% INSS
+      if (docEmit && docEmit.length === 11) {
+        const inssExpected = 0.11 * vb;
+        const jaConstaInss = processedRetIdx.size > 0 && Array.from(processedRetIdx).some(idx => {
+          const mm = moneyMatches.find(m => m.index === idx);
+          const ctx = fullText.substring(Math.max(0, mm.index - 30), mm.index).toUpperCase();
+          return /INSS/i.test(ctx);
+        });
 
-      // 2. Precedência: Valor Líquido é o Mestre
+        if (!jaConstaInss && inssExpected > 0) {
+          dc += inssExpected;
+          addLog('info', `💡 Aplicada retenção automática de 11% INSS (Pessoa Física).`);
+        }
+      }
+
+      // 4. Lógica de Reconciliação de Trindade (Bruto, Líquido, Desconto)
       if (vl > 0 && dc > 0 && (vb === 0 || Math.abs(vb - vl) < 0.1)) {
         vb = vl + dc;
       } else if (vb > 0 && dc > 0 && vl === 0) {
         vl = vb - dc;
-      } else if (vb > 0 && vl > 0 && Math.abs(vb - vl) > 0.1) {
-        dc = vb - vl;
+      } else if (vb > 0 && vl > 0) {
+        // Se Bruto e Líquido existem e o desconto extraído não bate, confia na diferença entre eles
+        if (Math.abs(vb - vl - dc) > 0.05) {
+          dc = Math.max(0, vb - vl);
+        }
       } else if (vb > 0 && vl === 0 && dc === 0) {
         vl = vb;
       } else if (vl > 0 && vb === 0 && dc === 0) {
         vb = vl;
       }
 
-      // 3. Fallback Agressivo Final (V16.5)
-      if (vl === 0 && moneyMatches.length > 0) {
-        vl = Math.max(...moneyMatches.map(m => m.val));
-        if (vb === 0) vb = vl;
+      // Fallback final
+      if (vl === 0 && vb === 0 && moneyMatches.length > 0) {
+        vl = moneyMatches[0].val;
+        vb = vl;
       }
 
-      // Validação final de sanidade
-      if (dc < 0) { const temp = vb; vb = vl; vl = temp; dc = 0; }
       vl = Math.max(0, vb - dc);
 
       // ── Extrair datas ──
@@ -3524,10 +3640,11 @@
 
       // ── Extrair Discriminação / Descrição dos Serviços ──
       let servicoExtraido = '';
-      const descMatch = fullText.match(/(?:Discrimina[çc][ãa]o\s+dos\s+Servi[çc]os|Descri[çc][ãa]o\s+dos\s+Servi[çc]os|Servi[çc]os?\s+Prestados?|Hist[óo]rico|Referente\s+a)[\s:]*\n*([\s\S]{5,300}?)(?:VALOR|Valor|Tribut|Total|Ded|C[óo]digo|PIS|COFINS|INSS|IRPJ|CSLL|Outras|Reten|PAG[AÁ]VEL|VENCIMENTO)/i);
+      // V17.3: Regex Refinado para Descrição Multi-linha (Captura até 500 chars)
+      const descMatch = fullText.match(/(?:Discrimina[çc][ãa]o\s+dos\s+Servi[çc]os|Descri[çc][ãa]o\s+dos\s+Servi[çc]os|Servi[çc]os?\s+Prestados?|Hist[óo]rico|Referente\s+a)[\s:]*\n*([\s\S]{5,800}?)(?:\n\s*(?:VALOR|Valor|Tribut|Total|Ded|C[óo]digo|PIS|COFINS|INSS|IRPJ|CSLL|Outras|Reten|PAG[AÁ]VEL|VENCIMENTO|DADOS|ISS|BASE|ALÍQUOTA)|$)/i);
       if (descMatch && descMatch[1]) {
         servicoExtraido = descMatch[1].replace(/\s+/g, ' ').replace(/[^a-zA-Z0-9Áàâãéèêíïóôõöúçñ\s.,/-]/g, '').trim();
-        if (servicoExtraido.length > 120) servicoExtraido = servicoExtraido.substring(0, 120) + '...';
+        if (servicoExtraido.length > 500) servicoExtraido = servicoExtraido.substring(0, 500) + '...';
       }
       if (!nfNum && !vl) throw new Error('Não foi possível extrair dados mínimos do PDF');
 
