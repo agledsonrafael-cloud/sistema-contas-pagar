@@ -3570,20 +3570,21 @@
       keys.retencoes.forEach(retType => {
         const bestMatch = moneyMatches.find(mm => {
           const ctx = fullText.substring(Math.max(0, mm.index - 40), mm.index + 10).toUpperCase();
-          // V17.2: Impedir colisão - Valor de retenção não pode ser o mesmo do Bruto ou Líquido extraído anteriormente
-          // a menos que o score de retenção seja muito alto ou o valor seja muito pequeno (< 50)
-          const isCollision = (mm.val === vb || mm.val === vl) && mm.val > 50;
+          // V18.2: Filtro Rigoroso de Ruído Fiscal
+          // Um valor de imposto nunca pode ser igual ao Valor Líquido ou Bruto se estes forem > 100
+          // E nunca pode ser igual ao Valor do Protocolo (que é o total a pagar)
+          const isCollision = (mm.val === vb || mm.val === vl || (protocolValue > 0 && mm.val === protocolValue)) && mm.val > 50;
           return retType.pattern.test(ctx) && !processedRetIdx.has(mm.index) && !isCollision;
         });
-        if (bestMatch && bestMatch.val < Math.max(vb, vl) * 0.5) { // Retenção raramente passa de 50%
+        if (bestMatch && bestMatch.val < Math.max(vb, vl) * 0.9) { // Retenção raramente passa de 90%
           sumIndividualRet += bestMatch.val;
           processedRetIdx.add(bestMatch.index);
         }
       });
 
       // 2. Determinar Desconto Total (dc)
-      // V18.1: Escudo de Colisão Global no Total Discount
-      const isTotalCollision = (total_dc_val === vb || total_dc_val === vl) && total_dc_val > 50;
+      // V18.2: Escudo de Colisão Ultra no Total Discount
+      const isTotalCollision = (total_dc_val === vb || total_dc_val === vl || (protocolValue > 0 && total_dc_val === protocolValue)) && total_dc_val > 50;
       dc = (total_dc_score > 10 && !isTotalCollision) ? total_dc_val : sumIndividualRet;
 
       // 3. Regra de Negócio Crítica: Pessoa Física (CPF) -> 11% INSS
@@ -3623,18 +3624,20 @@
         vb = vl;
       }
 
-      // 5. Verificação Final via Protocolo
+      // V18.2: Âncora de Protocolo Mandatória (Líquido Master)
       if (protocolValue > 0 && Math.abs(vl - protocolValue) > 0.05) {
-        // Se o valor extraído é EXATAMENTE o dobro do protocolo, muito provavelmente houve colisão
-        if (Math.abs(vl - (protocolValue * 2)) < 0.1 || Math.abs(vb - (protocolValue * 2)) < 0.1) {
-          addLog('warn', `⚠ Detectada colisão de valores. Ajustando para o valor do protocolo: R$ ${fn(protocolValue)}`);
-          vb = protocolValue;
-          vl = protocolValue;
-          dc = 0;
-        } else if (Math.abs(vb - protocolValue) < 0.05) {
-          // Se o Bruto bate com o protocolo mas o líquido não (devido a impostos), confia no líquido extraído
-          // Mas em geral, o protocolo representa o valor a pagar (Líquido)
+        if (Math.abs(vb - protocolValue) < 0.05) {
+          vl = protocolValue; dc = 0;
+        } else {
+          vl = protocolValue; if (vb < vl) vb = vl;
+          dc = Math.max(0, vb - vl);
         }
+      }
+
+      // V18.2: Escudo Anti-Duplicação Matemática (Fim do Valor Dobrado)
+      if (Math.abs(vb - (vl * 2)) < 0.1 && Math.abs(dc - vl) < 0.1 && vl > 100) {
+        vb = vl; dc = 0;
+        addLog('warn', `⚠ Detetada duplicação matemática (R$ ${fn(vl)}). Ajustado.`);
       }
 
       vl = Math.max(0, vb - dc);
@@ -3773,7 +3776,15 @@
         }
       }
 
-      const vl = Math.max(0, vb - dc);
+      let vl = Math.max(0, vb - dc);
+
+      // V18.2: Âncora de Protocolo para XML
+      if (protocolValue > 0 && Math.abs(vl - protocolValue) > 0.05) {
+        addLog('info', `💡 XML conciliado com Protocolo: R$ ${fn(protocolValue)}`);
+        vl = protocolValue;
+        if (vb < vl) vb = vl;
+        dc = Math.max(0, vb - vl);
+      }
       const detPag = xmlNode(doc, 'detPag');
       const tipo = mapTPagToTipo(xmlText(detPag, 'tPag'));
 
