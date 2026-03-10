@@ -3684,7 +3684,8 @@
 
       // 3. Motor Fiscal PF/PJ (V19.0)
       let isSmartDc = false;
-      if (docEmit && docEmit.length === 11) {
+      const resolvedDocLen = (f && f.doc) ? onlyDigits(f.doc).length : (docEmit ? docEmit.length : 0);
+      if (resolvedDocLen === 11) {
         // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
         const inssExpected = 0.11 * vb;
 
@@ -3696,7 +3697,7 @@
             addLog('info', `💡 CPF detectado: Retenção obrigatória de 11% INSS (R$ ${fn(dc)}) aplicada.`);
           }
         }
-      } else if (docEmit && docEmit.length === 14) {
+      } else if (resolvedDocLen === 14) {
         // REGRA PARA PESSOA JURÍDICA (CNPJ): Confiar na leitura inteligente
         if (sumIndividualRet > 0 && Math.abs(sumIndividualRet - dc) > 0.05) {
           // Se a soma das retenções individuais for diferente do 'Desconto Total' lido, 
@@ -3795,10 +3796,11 @@
       }
       if (!nfNum && !vl) throw new Error('Não foi possível extrair dados mínimos do PDF');
 
-      const formattedDoc = docEmit.length === 14 ? fmtCnpj(docEmit) : (docEmit.length === 11 ? fmtCpf(docEmit) : docEmit);
+      const finalDoc = String(f?.doc || docEmit || '').replace(/[^\d]/g, '');
+      const formattedDoc = finalDoc.length === 14 ? fmtCnpj(finalDoc) : (finalDoc.length === 11 ? fmtCpf(finalDoc) : finalDoc);
 
       // ── Inteligência de Memória de Sugestões AG ──
-      const docClean = docEmit ? String(docEmit).replace(/[^\d]/g, '') : '';
+      const docClean = finalDoc;
       let smartHist = {};
       if (docClean) {
         try { smartHist = JSON.parse(localStorage.getItem('ag_smart_history') || '{}')[docClean] || {}; } catch (e) { }
@@ -3901,7 +3903,8 @@
 
       // 3. Motor Fiscal PF/PJ (V19.0)
       let isSmartDc = false;
-      if (docEmit && docEmit.length === 11) {
+      const resolvedDocLen = (f && f.doc) ? onlyDigits(f.doc).length : (docEmit ? docEmit.length : 0);
+      if (resolvedDocLen === 11) {
         // REGRA ABSOLUTA PARA PESSOA FÍSICA (CPF): Reter 11% de INSS sobre o Bruto
         const inssExpected = 0.11 * vb;
         if (inssExpected > 0) {
@@ -3929,7 +3932,8 @@
       const detPag = xmlNode(doc, 'detPag');
       const tipo = mapTPagToTipo(xmlText(detPag, 'tPag'));
 
-      const formattedDoc = docEmit.length === 14 ? fmtCnpj(docEmit) : (docEmit.length === 11 ? fmtCpf(docEmit) : docEmit);
+      const finalDoc = String(f?.doc || docEmit || '').replace(/[^\d]/g, '');
+      const formattedDoc = finalDoc.length === 14 ? fmtCnpj(finalDoc) : (finalDoc.length === 11 ? fmtCpf(finalDoc) : finalDoc);
 
       // ── Descrição e Inteligência Histórica XML ──
       const det = xmlNode(doc, 'det');
@@ -3937,7 +3941,7 @@
       let servicoXml = xmlText(prod, 'xProd') || xmlText(doc, 'Discriminacao') || '';
       if (servicoXml.length > 80) servicoXml = servicoXml.substring(0, 80) + '...';
 
-      const docClean = docEmit ? String(docEmit).replace(/[^\d]/g, '') : '';
+      const docClean = finalDoc;
       let smartHist = {};
       if (docClean) {
         try { smartHist = JSON.parse(localStorage.getItem('ag_smart_history') || '{}')[docClean] || {}; } catch (e) { }
